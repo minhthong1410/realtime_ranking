@@ -1,0 +1,167 @@
+basePath: /api/v1
+definitions:
+  handler.Interaction:
+    properties:
+      timestamp:
+        type: integer
+      type:
+        type: string
+      user_id:
+        type: string
+      video_id:
+        type: string
+      watch_time:
+        description: in seconds
+        type: integer
+    type: object
+  handler.Video:
+    properties:
+      id:
+        type: string
+      title:
+        type: string
+      creator_id:
+        type: string
+      score:
+        type: number
+        format: float
+    type: object
+  httputil.ErrorResponse:
+    properties:
+      code:
+        type: integer
+      message:
+        type: string
+    type: object
+  httputil.HttpResponse:
+    properties:
+      code:
+        type: integer
+      data: {}
+    type: object
+host: localhost:8080
+info:
+  contact: {}
+  description: Realtime ranking API
+  title: Realtime Ranking API
+  version: "1.0"
+paths:
+  /api/v1/interaction:
+    post:
+      consumes:
+        - application/json
+      description: Update a video's score based on user interaction (e.g., like, comment, share)
+      parameters:
+        - description: User interaction details
+          in: body
+          name: interaction
+          required: true
+          schema:
+            $ref: '#/definitions/handler.Interaction'
+      produces:
+        - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            type: object
+            properties:
+              code:
+                type: integer
+              data:
+                type: object
+                properties:
+                  new_score:
+                    type: number
+                    format: float
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/httputil.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/httputil.ErrorResponse'
+      summary: Update video score
+      tags:
+        - Interaction
+  /api/v1/ranking:
+    get:
+      consumes:
+        - application/json
+      description: Retrieve the global ranking of videos based on their scores
+      parameters:
+        - description: 'Number of videos to retrieve (default: 10)'
+          in: query
+          name: limit
+          type: integer
+        - description: 'Offset for pagination (default: 0)'
+          in: query
+          name: offset
+          type: integer
+      produces:
+        - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            type: object
+            properties:
+              code:
+                type: integer
+              data:
+                type: array
+                items:
+                  $ref: '#/definitions/handler.Video'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/httputil.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/httputil.ErrorResponse'
+      summary: Get global video rankings
+      tags:
+        - Ranking
+  /api/v1/ranking/personal:
+    get:
+      consumes:
+        - application/json
+      description: Retrieve a personalized ranking of videos for a specific user
+      parameters:
+        - description: User ID
+          in: query
+          name: user_id
+          required: true
+          type: string
+        - description: 'Number of videos to retrieve (default: 20)'
+          in: query
+          name: limit
+          type: integer
+      produces:
+        - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            type: object
+            properties:
+              code:
+                type: integer
+              data:
+                type: array
+                items:
+                  $ref: '#/definitions/handler.Video'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/httputil.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/httputil.ErrorResponse'
+      summary: Get personalized video rankings
+      tags:
+        - Ranking
+swagger: "2.0"

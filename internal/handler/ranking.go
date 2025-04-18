@@ -19,6 +19,7 @@ const (
 	InteractionLike    = "like"
 	InteractionComment = "comment"
 	InteractionShare   = "share"
+	InteractionWatch   = "watch"
 )
 
 var scoreIncrements = map[string]float64{
@@ -26,6 +27,7 @@ var scoreIncrements = map[string]float64{
 	InteractionLike:    5.0,
 	InteractionComment: 10.0,
 	InteractionShare:   20.0,
+	InteractionWatch:   2.0,
 }
 
 type RankingHandler struct {
@@ -45,9 +47,22 @@ type Interaction struct {
 	Type      string `json:"type"`
 	UserID    string `json:"user_id"`
 	Timestamp int64  `json:"timestamp"`
+	WatchTime int64  `json:"watch_time,omitempty"` // in seconds
 }
 
-// GetRanking retrieves the global ranking of videos
+// @Summary		Get global video rankings
+// @Description	Retrieve the global ranking of videos based on their scores
+// @Tags			Ranking
+// @Accept			json
+// @Produce		json
+// @Param			limit	query		int	false	"Number of videos to retrieve (default: 10)"
+// @Param			offset	query		int	false	"Offset for pagination (default: 0)"
+//
+// @Success		200		{object}	httputil.HttpResponse{data=[]handler.Video}
+//
+// @Failure		400		{object}	httputil.ErrorResponse
+// @Failure		500		{object}	httputil.ErrorResponse
+// @Router			/api/v1/ranking [get]
 func (h *RankingHandler) GetRanking(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 
@@ -96,15 +111,45 @@ func (h *RankingHandler) GetRanking(w http.ResponseWriter, r *http.Request) erro
 }
 
 // UpdateScore updates a video's score based on user interaction
+//
+//	@Summary		Update video score
+//	@Description	Update a video's score based on user interaction (e.g., like, comment, share)
+//	@Tags			Interaction
+//	@Accept			json
+//	@Produce		json
+//	@Param			interaction	body		Interaction	true	"User interaction details"
+//
+//	@Success		200			{object}	httputil.HttpResponse{data=object{new_score=number}}
+//
+//	@Failure		400			{object}	httputil.ErrorResponse
+//	@Failure		500			{object}	httputil.ErrorResponse
+//	@Router			/api/v1/interaction [post]
 func (h *RankingHandler) UpdateScore(w http.ResponseWriter, r *http.Request) error {
 	var interaction Interaction
 	if err := json.NewDecoder(r.Body).Decode(&interaction); err != nil {
 		return ErrorInvalidRequestBody
 	}
 
+	if interaction.VideoID == "" || interaction.UserID == "" {
+		return ErrorInvalidRequestBody
+	}
+	if interaction.VideoID == "" {
+		return ErrorInvalidVideoID
+	}
+	if interaction.UserID == "" {
+		return ErrorUserIDMissing
+	}
+	if interaction.Timestamp <= 0 {
+		return ErrorInvalidTimestamp
+	}
+
 	increment, ok := scoreIncrements[interaction.Type]
 	if !ok {
 		return ErrorInvalidInteractionType
+	}
+
+	if interaction.Type == InteractionWatch && interaction.WatchTime > 0 {
+		increment *= float64(interaction.WatchTime) / 60.0 // Example: scale by minutes watched
 	}
 
 	ctx := r.Context()
@@ -115,7 +160,7 @@ func (h *RankingHandler) UpdateScore(w http.ResponseWriter, r *http.Request) err
 		return ErrorGetDataFailed
 	}
 
-	// Update global ranking
+	// update global ranking
 	globalKey := "rankings:global"
 	newScore, err := h.redis.ZIncrBy(ctx, globalKey, increment, interaction.VideoID).Result()
 	if err != nil {
@@ -123,7 +168,7 @@ func (h *RankingHandler) UpdateScore(w http.ResponseWriter, r *http.Request) err
 		return ErrorUpdateDataFailed
 	}
 
-	// Update creator-specific ranking
+	// update creator-specific ranking
 	creatorKey := fmt.Sprintf("creator:%s:videos", creatorID)
 	_, err = h.redis.ZIncrBy(ctx, creatorKey, increment, interaction.VideoID).Result()
 	if err != nil {
@@ -131,10 +176,17 @@ func (h *RankingHandler) UpdateScore(w http.ResponseWriter, r *http.Request) err
 		return ErrorUpdateDataFailed
 	}
 
-	// Update score in video hash for consistency
+	// update score
 	err = h.redis.HSet(ctx, videoKey, "score", newScore).Err()
 	if err != nil {
 		h.logger.Info("failed to update score in video hash", zap.Error(err))
+		return ErrorUpdateDataFailed
+	}
+
+	interactionKey := fmt.Sprintf("user:%s:interactions", interaction.UserID)
+	err = h.redis.SAdd(ctx, interactionKey, interaction.VideoID).Err()
+	if err != nil {
+		h.logger.Info("failed to store user interaction", zap.Error(err))
 		return ErrorUpdateDataFailed
 	}
 
@@ -145,6 +197,18 @@ func (h *RankingHandler) UpdateScore(w http.ResponseWriter, r *http.Request) err
 }
 
 // GetPersonalRanking retrieves a personalized ranking for a user
+//
+//	@Summary		Get personalized video rankings
+//	@Description	Retrieve a personalized ranking of videos for a specific user
+//	@Tags			Ranking
+//	@Accept			json
+//	@Produce		json
+//	@Param			user_id	query		string	true	"User ID"
+//	@Param			limit	query		int		false	"Number of videos to retrieve (default: 20)"
+//	@Success		200		{object}	httputil.HttpResponse{data=[]handler.Video}
+//	@Failure		400		{object}	httputil.ErrorResponse
+//	@Failure		500		{object}	httputil.ErrorResponse
+//	@Router			/api/v1/ranking/personal [get]
 func (h *RankingHandler) GetPersonalRanking(w http.ResponseWriter, r *http.Request) error {
 	userID := r.URL.Query().Get("user_id")
 	if userID == "" {
@@ -153,7 +217,7 @@ func (h *RankingHandler) GetPersonalRanking(w http.ResponseWriter, r *http.Reque
 
 	limit, err := strconv.Atoi(r.URL.Query().Get("limit"))
 	if err != nil {
-		limit = 20 // default limit
+		limit = 20
 	}
 	if limit > 100 || limit < 1 {
 		return ErrorLimitRange
@@ -164,6 +228,14 @@ func (h *RankingHandler) GetPersonalRanking(w http.ResponseWriter, r *http.Reque
 	followedCreators, err := h.redis.SMembers(ctx, followKey).Result()
 	if err != nil {
 		h.logger.Info("failed to get followed creators", zap.Error(err))
+		return ErrorGetDataFailed
+	}
+
+	// Fetch user interaction history
+	interactionKey := fmt.Sprintf("user:%s:interactions", userID)
+	interactedVideos, err := h.redis.SMembers(ctx, interactionKey).Result()
+	if err != nil {
+		h.logger.Info("failed to get user interactions", zap.Error(err))
 		return ErrorGetDataFailed
 	}
 
@@ -181,7 +253,6 @@ func (h *RankingHandler) GetPersonalRanking(w http.ResponseWriter, r *http.Reque
 		candidateVideos = append(candidateVideos, videos...)
 	}
 
-	// Add top global videos
 	globalVideos, err := h.redis.ZRevRange(ctx, "rankings:global", 0, topMGlobal-1).Result()
 	if err != nil {
 		h.logger.Info("failed to get global rankings", zap.Error(err))
@@ -199,7 +270,7 @@ func (h *RankingHandler) GetPersonalRanking(w http.ResponseWriter, r *http.Reque
 		videoIDs = append(videoIDs, videoID)
 	}
 
-	// Fetch scores
+	// Fetch scores and creator IDs
 	scores, err := h.redis.ZMScore(ctx, "rankings:global", videoIDs...).Result()
 	if err != nil {
 		h.logger.Info("failed to get scores", zap.Error(err))
@@ -210,7 +281,6 @@ func (h *RankingHandler) GetPersonalRanking(w http.ResponseWriter, r *http.Reque
 		scoreMap[videoID] = scores[i]
 	}
 
-	// Fetch creator IDs using pipeline
 	pipe := h.redis.Pipeline()
 	creatorCmds := make(map[string]*redis.StringCmd)
 	for videoID := range videoSet {
@@ -230,14 +300,17 @@ func (h *RankingHandler) GetPersonalRanking(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	// Apply boosts and sort
-	const boost = 100.0
-
+	// Apply boosts
+	const followBoost = 100.0
+	const interactionBoost = 50.0
 	var adjustedScores []VideoScore
 	for videoID := range videoSet {
 		score := scoreMap[videoID]
 		if creatorID, ok := creatorMap[videoID]; ok && contains(followedCreators, creatorID) {
-			score += boost
+			score += followBoost
+		}
+		if contains(interactedVideos, videoID) {
+			score += interactionBoost // Boost videos the user has interacted with
 		}
 		adjustedScores = append(adjustedScores, VideoScore{videoID, score})
 	}
@@ -264,7 +337,7 @@ func (h *RankingHandler) GetPersonalRanking(w http.ResponseWriter, r *http.Reque
 			ID:        item.VideoID,
 			Title:     videoData["title"],
 			CreatorID: videoData["creator_id"],
-			Score:     score, // Return original score
+			Score:     score,
 		})
 	}
 

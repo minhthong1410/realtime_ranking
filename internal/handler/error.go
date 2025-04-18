@@ -54,4 +54,12 @@ var (
 		Code: http.StatusBadRequest,
 		Err:  errors.New("offset must be greater than 0"),
 	}
+	ErrorInvalidTimestamp = RankingError{
+		Code: http.StatusBadRequest,
+		Err:  errors.New("invalid timestamp"),
+	}
+	ErrorInvalidVideoID = RankingError{
+		Code: http.StatusBadRequest,
+		Err:  errors.New("invalid video_id"),
+	}
 )
