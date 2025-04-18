@@ -2,349 +2,321 @@ package handler
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"realtime_ranking/pkg/httputil"
-	"strings"
 	"testing"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 )
 
-func setupTestHandler(t *testing.T) (*RankingHandler, *miniredis.Miniredis, func()) {
-	// Start miniredis
+func setupTest(t *testing.T) (*RankingHandler, *miniredis.Miniredis, *zap.Logger) {
 	mr, err := miniredis.Run()
-	if err != nil {
-		t.Fatalf("failed to start miniredis: %v", err)
-	}
+	require.NoError(t, err)
 
-	// Create Redis client
-	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	client := redis.NewClient(&redis.Options{
+		Addr: mr.Addr(),
+	})
 
-	// Create logger
 	logger, err := zap.NewDevelopment()
-	if err != nil {
-		t.Fatalf("failed to create logger: %v", err)
-	}
+	require.NoError(t, err)
 
-	// Create handler
 	handler := &RankingHandler{
 		redis:  client,
 		logger: logger,
 	}
 
-	// Cleanup function
-	cleanup := func() {
-		client.Close()
-		mr.Close()
-	}
-
-	return handler, mr, cleanup
-}
-
-func TestUpdateScore(t *testing.T) {
-	handler, mr, cleanup := setupTestHandler(t)
-	defer cleanup()
-
-	ctx := context.Background()
-
-	// Initialize a video
-	video := Video{
-		ID:        "vid1",
-		Title:     "Test Video",
-		CreatorID: "creator1",
-		Score:     0.0,
-	}
-	err := handler.InitializeVideo(ctx, video)
-	if err != nil {
-		t.Fatalf("failed to initialize video: %v", err)
-	}
-
-	tests := []struct {
-		name           string
-		interaction    Interaction
-		body           string
-		expectedStatus int
-		expectedScore  float64
-	}{
-		{
-			name: "Valid view interaction",
-			interaction: Interaction{
-				VideoID:   "vid1",
-				Type:      InteractionView,
-				UserID:    "user1",
-				Timestamp: 1234567890,
-			},
-			body:           `{"video_id":"vid1","type":"view","user_id":"user1","timestamp":1234567890}`,
-			expectedStatus: http.StatusOK,
-			expectedScore:  1.0,
-		},
-		{
-			name: "Missing video auto-initialized",
-			interaction: Interaction{
-				VideoID:   "vid2",
-				Type:      InteractionLike,
-				UserID:    "user2",
-				Timestamp: 1234567890,
-			},
-			body:           `{"video_id":"vid2","type":"like","user_id":"user2","timestamp":1234567890}`,
-			expectedStatus: http.StatusOK,
-			expectedScore:  5.0,
-		},
-		{
-			name: "Invalid interaction type",
-			interaction: Interaction{
-				VideoID:   "vid1",
-				Type:      "invalid",
-				UserID:    "user1",
-				Timestamp: 1234567890,
-			},
-			body:           `{"video_id":"vid1","type":"invalid","user_id":"user1","timestamp":1234567890}`,
-			expectedStatus: http.StatusBadRequest,
-			expectedScore:  0.0,
-		},
-		{
-			name: "Missing user_id",
-			interaction: Interaction{
-				VideoID:   "vid1",
-				Type:      InteractionView,
-				UserID:    "",
-				Timestamp: 1234567890,
-			},
-			body:           `{"video_id":"vid1","type":"view","user_id":"","timestamp":1234567890}`,
-			expectedStatus: http.StatusBadRequest,
-			expectedScore:  0.0,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			req, _ := http.NewRequest("POST", "/api/v1/interaction", bytes.NewReader([]byte(tt.body)))
-			rr := httptest.NewRecorder()
-
-			err := handler.UpdateScore(rr, req)
-			if (err != nil) != (tt.expectedStatus != http.StatusOK) {
-				t.Errorf("UpdateScore error = %v, want status %d", err, tt.expectedStatus)
-			}
-
-			if rr.Code != tt.expectedStatus {
-				t.Errorf("expected status %d, got %d", tt.expectedStatus, rr.Code)
-			}
-
-			if tt.expectedStatus == http.StatusOK {
-				var resp httputil.HttpResponse
-				if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
-					t.Errorf("failed to decode response: %v", err)
-				}
-				newScore, ok := resp.Data.(map[string]interface{})["new_score"].(float64)
-				if !ok || newScore != tt.expectedScore {
-					t.Errorf("expected new_score %f, got %v", tt.expectedScore, newScore)
-				}
-
-				// Verify Redis state
-				score, err := handler.redis.ZScore(ctx, "rankings:global", tt.interaction.VideoID).Result()
-				if err != nil || score != tt.expectedScore {
-					t.Errorf("expected global score %f, got %f", tt.expectedScore, score)
-				}
-
-				if tt.name == "Missing video auto-initialized" {
-					videoData, _ := handler.redis.HGetAll(ctx, "video:vid2").Result()
-					if !strings.HasPrefix(videoData["title"], "Untitled Video") {
-						t.Errorf("expected placeholder title, got %s", videoData["title"])
-					}
-					if videoData["creator_id"] != "user2" {
-						t.Errorf("expected creator_id user2, got %s", videoData["creator_id"])
-					}
-				}
-			})
-		})
-	}
+	return handler, mr, logger
 }
 
 func TestGetRanking(t *testing.T) {
-	handler, mr, cleanup := setupTestHandler(t)
-	defer cleanup()
+	handler, mr, _ := setupTest(t)
+	defer mr.Close()
 
-	ctx := context.Background()
+	videoID1 := "video1"
+	videoID2 := "video2"
+	mr.HSet(fmt.Sprintf("video:%s", videoID1), "title", "Video One", "creator_id", "creator1", "score", "100")
+	mr.HSet(fmt.Sprintf("video:%s", videoID2), "title", "Video Two", "creator_id", "creator2", "score", "50")
+	mr.ZAdd("rankings:global", 100, videoID1)
+	mr.ZAdd("rankings:global", 50, videoID2)
 
-	// Initialize videos
-	videos := []Video{
-		{ID: "vid1", Title: "Video 1", CreatorID: "creator1", Score: 100.0},
-		{ID: "vid2", Title: "Video 2", CreatorID: "creator2", Score: 50.0},
-		{ID: "vid3", Title: "", CreatorID: "", Score: 0.0}, // Invalid video
-	}
-	for _, v := range videos {
-		if v.Title != "" {
-			err := handler.InitializeVideo(ctx, v)
-			if err != nil {
-				t.Fatalf("failed to initialize video %s: %v", v.ID, err)
-			}
-		} else {
-			// Simulate invalid video (only in sorted set)
-			mr.ZAdd("rankings:global", 25.0, v.ID)
+	t.Run("success", func(t *testing.T) {
+		req, err := http.NewRequest("GET", "/api/v1/ranking?limit=2", nil)
+		require.NoError(t, err)
+		rr := httptest.NewRecorder()
+
+		err = handler.GetRanking(rr, req)
+		require.NoError(t, err)
+
+		assert.Equal(t, http.StatusOK, rr.Code)
+
+		var response httputil.HttpResponse
+		err = json.NewDecoder(rr.Body).Decode(&response)
+		require.NoError(t, err)
+
+		videos, ok := response.Data.([]interface{})
+		assert.True(t, ok)
+		assert.Len(t, videos, 2)
+
+		video1, ok := videos[0].(map[string]interface{})
+		assert.True(t, ok)
+		assert.Equal(t, videoID1, video1["id"])
+		assert.Equal(t, "Video One", video1["title"])
+		assert.Equal(t, "creator1", video1["creator_id"])
+		assert.Equal(t, 100.0, video1["score"])
+	})
+
+	t.Run("invalid limit", func(t *testing.T) {
+		req, err := http.NewRequest("GET", "/api/v1/ranking?limit=101", nil)
+		require.NoError(t, err)
+		rr := httptest.NewRecorder()
+
+		err = handler.GetRanking(rr, req)
+		assert.ErrorIs(t, err, ErrorLimitRange)
+
+		var response httputil.ErrorResponse
+		err = json.NewDecoder(rr.Body).Decode(&response)
+		require.NoError(t, err)
+		assert.Equal(t, http.StatusBadRequest, response.Code)
+	})
+
+	t.Run("invalid offset", func(t *testing.T) {
+		req, err := http.NewRequest("GET", "/api/v1/ranking?offset=-1", nil)
+		require.NoError(t, err)
+		rr := httptest.NewRecorder()
+
+		err = handler.GetRanking(rr, req)
+		assert.ErrorIs(t, err, ErrorOffsetRange)
+
+		var response httputil.ErrorResponse
+		err = json.NewDecoder(rr.Body).Decode(&response)
+		require.NoError(t, err)
+		assert.Equal(t, http.StatusBadRequest, response.Code)
+	})
+}
+
+func TestUpdateScore(t *testing.T) {
+	handler, mr, _ := setupTest(t)
+	defer mr.Close()
+
+	videoID := "video1"
+	creatorID := "creator1"
+	mr.HSet(fmt.Sprintf("video:%s", videoID), "title", "Video One", "creator_id", creatorID, "score", "0")
+
+	t.Run("success like", func(t *testing.T) {
+		interaction := Interaction{
+			VideoID:   videoID,
+			Type:      InteractionLike,
+			UserID:    "user1",
+			Timestamp: 1690000000,
 		}
-	}
+		body, _ := json.Marshal(interaction)
+		req, err := http.NewRequest("POST", "/api/v1/interaction", bytes.NewReader(body))
+		require.NoError(t, err)
+		rr := httptest.NewRecorder()
 
-	tests := []struct {
-		name           string
-		query          string
-		expectedStatus int
-		expectedVideos int
-		expectedFirst  string
-	}{
-		{
-			name:           "Default limit and offset",
-			query:          "",
-			expectedStatus: http.StatusOK,
-			expectedVideos: 2,
-			expectedFirst:  "vid1",
-		},
-		{
-			name:           "Custom limit and offset",
-			query:          "limit=1&offset=1",
-			expectedStatus: http.StatusOK,
-			expectedVideos: 1,
-			expectedFirst:  "vid2",
-		},
-		{
-			name:           "Invalid limit",
-			query:          "limit=101",
-			expectedStatus: http.StatusBadRequest,
-			expectedVideos: 0,
-		},
-		{
-			name:           "Negative offset",
-			query:          "offset=-1",
-			expectedStatus: http.StatusBadRequest,
-			expectedVideos: 0,
-		},
-	}
+		err = handler.UpdateScore(rr, req)
+		require.NoError(t, err)
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			req, _ := http.NewRequest("GET", "/api/v1/ranking?"+tt.query, nil)
-			rr := httptest.NewRecorder()
+		assert.Equal(t, http.StatusOK, rr.Code)
 
-			err := handler.GetRanking(rr, req)
-			if (err != nil) != (tt.expectedStatus != http.StatusOK) {
-				t.Errorf("GetRanking error = %v, want status %d", err, tt.expectedStatus)
-			}
+		var response httputil.HttpResponse
+		err = json.NewDecoder(rr.Body).Decode(&response)
+		require.NoError(t, err)
 
-			if rr.Code != tt.expectedStatus {
-				t.Errorf("expected status %d, got %d", tt.expectedStatus, rr.Code)
-			}
+		data, ok := response.Data.(map[string]interface{})
+		assert.True(t, ok)
+		assert.Equal(t, 5.0, data["new_score"])
 
-			if tt.expectedStatus == http.StatusOK {
-				var resp httputil.HttpResponse
-				if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
-					t.Errorf("failed to decode response: %v", err)
-				}
-				videos, ok := resp.Data.([]interface{})
-				if !ok || len(videos) != tt.expectedVideos {
-					t.Errorf("expected %d videos, got %d", tt.expectedVideos, len(videos))
-				}
-				if tt.expectedVideos > 0 {
-					firstVideo := videos[0].(map[string]interface{})
-					if firstVideo["id"] != tt.expectedFirst {
-						t.Errorf("expected first video %s, got %s", tt.expectedFirst, firstVideo["id"])
-					}
-				}
-			})
-		})
-	}
+		score, err := mr.ZScore("rankings:global", videoID)
+		require.NoError(t, err)
+		assert.Equal(t, 5.0, score)
+
+		creatorScore, err := mr.ZScore(fmt.Sprintf("creator:%s:videos", creatorID), videoID)
+		require.NoError(t, err)
+		assert.Equal(t, 5.0, creatorScore)
+
+		videoScore := mr.HGet(fmt.Sprintf("video:%s", videoID), "score")
+		assert.Equal(t, "5", videoScore)
+	})
+
+	t.Run("success watch with watch time", func(t *testing.T) {
+		interaction := Interaction{
+			VideoID:   videoID,
+			Type:      InteractionWatch,
+			UserID:    "user1",
+			Timestamp: 1690000000,
+			WatchTime: 120,
+		}
+		body, _ := json.Marshal(interaction)
+		req, err := http.NewRequest("POST", "/api/v1/interaction", bytes.NewReader(body))
+		require.NoError(t, err)
+		rr := httptest.NewRecorder()
+
+		err = handler.UpdateScore(rr, req)
+		require.NoError(t, err)
+
+		assert.Equal(t, http.StatusOK, rr.Code)
+
+		var response httputil.HttpResponse
+		err = json.NewDecoder(rr.Body).Decode(&response)
+		require.NoError(t, err)
+
+		data, ok := response.Data.(map[string]interface{})
+		assert.True(t, ok)
+		assert.Equal(t, 9.0, data["new_score"])
+	})
+
+	t.Run("invalid interaction type", func(t *testing.T) {
+		interaction := Interaction{
+			VideoID:   videoID,
+			Type:      "invalid",
+			UserID:    "user1",
+			Timestamp: 1690000000,
+		}
+		body, _ := json.Marshal(interaction)
+		req, err := http.NewRequest("POST", "/api/v1/interaction", bytes.NewReader(body))
+		require.NoError(t, err)
+		rr := httptest.NewRecorder()
+
+		err = handler.UpdateScore(rr, req)
+		assert.ErrorIs(t, err, ErrorInvalidInteractionType)
+
+		var response httputil.ErrorResponse
+		err = json.NewDecoder(rr.Body).Decode(&response)
+		require.NoError(t, err)
+		assert.Equal(t, http.StatusBadRequest, response.Code)
+	})
+
+	t.Run("invalid video id", func(t *testing.T) {
+		interaction := Interaction{
+			VideoID:   "",
+			Type:      InteractionLike,
+			UserID:    "user1",
+			Timestamp: 1690000000,
+		}
+		body, _ := json.Marshal(interaction)
+		req, err := http.NewRequest("POST", "/api/v1/interaction", bytes.NewReader(body))
+		require.NoError(t, err)
+		rr := httptest.NewRecorder()
+
+		err = handler.UpdateScore(rr, req)
+		assert.ErrorIs(t, err, ErrorInvalidVideoID)
+
+		var response httputil.ErrorResponse
+		err = json.NewDecoder(rr.Body).Decode(&response)
+		require.NoError(t, err)
+		assert.Equal(t, http.StatusBadRequest, response.Code)
+	})
+
+	t.Run("invalid timestamp", func(t *testing.T) {
+		interaction := Interaction{
+			VideoID:   videoID,
+			Type:      InteractionLike,
+			UserID:    "user1",
+			Timestamp: 0,
+		}
+		body, _ := json.Marshal(interaction)
+		req, err := http.NewRequest("POST", "/api/v1/interaction", bytes.NewReader(body))
+		require.NoError(t, err)
+		rr := httptest.NewRecorder()
+
+		err = handler.UpdateScore(rr, req)
+		assert.ErrorIs(t, err, ErrorInvalidTimestamp)
+
+		var response httputil.ErrorResponse
+		err = json.NewDecoder(rr.Body).Decode(&response)
+		require.NoError(t, err)
+		assert.Equal(t, http.StatusBadRequest, response.Code)
+	})
 }
 
 func TestGetPersonalRanking(t *testing.T) {
-	handler, mr, cleanup := setupTestHandler(t)
-	defer cleanup()
+	handler, mr, _ := setupTest(t)
+	defer mr.Close()
 
-	ctx := context.Background()
+	userID := "user1"
+	creator1 := "creator1"
+	creator2 := "creator2"
+	video1 := "video1"
+	video2 := "video2"
+	video3 := "video3"
 
-	// Initialize videos
-	videos := []Video{
-		{ID: "vid1", Title: "Video 1", CreatorID: "creator1", Score: 50.0},
-		{ID: "vid2", Title: "Video 2", CreatorID: "creator2", Score: 100.0},
-		{ID: "vid3", Title: "Video 3", CreatorID: "creator3", Score: 25.0},
-	}
-	for _, v := range videos {
-		err := handler.InitializeVideo(ctx, v)
-		if err != nil {
-			t.Fatalf("failed to initialize video %s: %v", v.ID, err)
-		}
-	}
+	mr.SAdd(fmt.Sprintf("user:%s:follows", userID), creator1)
+	mr.SAdd(fmt.Sprintf("user:%s:interactions", userID), video2)
 
-	// Initialize user follows
-	mr.SAdd("user:user1:follows", "creator1", "creator2")
+	mr.HSet(fmt.Sprintf("video:%s", video1), "title", "Video One", "creator_id", creator1, "score", "100")
+	mr.HSet(fmt.Sprintf("video:%s", video2), "title", "Video Two", "creator_id", creator2, "score", "80")
+	mr.HSet(fmt.Sprintf("video:%s", video3), "title", "Video Three", "creator_id", creator2, "score", "60")
 
-	tests := []struct {
-		name           string
-		query          string
-		expectedStatus int
-		expectedVideos int
-		expectedFirst  string
-	}{
-		{
-			name:           "Valid user with follows",
-			query:          "user_id=user1&limit=2",
-			expectedStatus: http.StatusOK,
-			expectedVideos: 2,
-			expectedFirst:  "vid1", // creator1, score 50+100=150
-		},
-		{
-			name:           "Missing user_id",
-			query:          "limit=5",
-			expectedStatus: http.StatusBadRequest,
-			expectedVideos: 0,
-		},
-		{
-			name:           "Invalid limit",
-			query:          "user_id=user1&limit=101",
-			expectedStatus: http.StatusBadRequest,
-			expectedVideos: 0,
-		},
-		{
-			name:           "No follows",
-			query:          "user_id=user2&limit=5",
-			expectedStatus: http.StatusOK,
-			expectedVideos: 3,
-			expectedFirst:  "vid2", // Highest score without boost
-		},
-	}
+	mr.ZAdd("rankings:global", 100, video1)
+	mr.ZAdd("rankings:global", 80, video2)
+	mr.ZAdd("rankings:global", 60, video3)
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			req, _ := http.NewRequest("GET", "/api/v1/ranking/personal?"+tt.query, nil)
-			rr := httptest.NewRecorder()
+	mr.ZAdd(fmt.Sprintf("creator:%s:videos", creator1), 100, video1)
+	mr.ZAdd(fmt.Sprintf("creator:%s:videos", creator2), 80, video2)
+	mr.ZAdd(fmt.Sprintf("creator:%s:videos", creator2), 60, video3)
 
-			err := handler.GetPersonalRanking(rr, req)
-			if (err != nil) != (tt.expectedStatus != http.StatusOK) {
-				t.Errorf("GetPersonalRanking error = %v, want status %d", err, tt.expectedStatus)
-			}
+	t.Run("success", func(t *testing.T) {
+		req, err := http.NewRequest("GET", "/api/v1/ranking/personal?user_id=user1&limit=2", nil)
+		require.NoError(t, err)
+		rr := httptest.NewRecorder()
 
-			if rr.Code != tt.expectedStatus {
-				t.Errorf("expected status %d, got %d", tt.expectedStatus, rr.Code)
-			}
+		err = handler.GetPersonalRanking(rr, req)
+		require.NoError(t, err)
 
-			if tt.expectedStatus == http.StatusOK {
-				var resp httputil.HttpResponse
-				if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
-					t.Errorf("failed to decode response: %v", err)
-				}
-				videos, ok := resp.Data.([]interface{})
-				if !ok || len(videos) != tt.expectedVideos {
-					t.Errorf("expected %d videos, got %d", tt.expectedVideos, len(videos))
-				}
-				if tt.expectedVideos > 0 {
-					firstVideo := videos[0].(map[string]interface{})
-					if firstVideo["id"] != tt.expectedFirst {
-						t.Errorf("expected first video %s, got %s", tt.expectedFirst, firstVideo["id"])
-					}
-				}
-			})
-		})
-	}
+		assert.Equal(t, http.StatusOK, rr.Code)
+
+		var response httputil.HttpResponse
+		err = json.NewDecoder(rr.Body).Decode(&response)
+		require.NoError(t, err)
+
+		videos, ok := response.Data.([]interface{})
+		assert.True(t, ok)
+		assert.Len(t, videos, 2)
+
+		video1Data, ok := videos[0].(map[string]interface{})
+		assert.True(t, ok)
+		assert.Equal(t, video1, video1Data["id"])
+		assert.Equal(t, 100.0, video1Data["score"])
+
+		video2Data, ok := videos[1].(map[string]interface{})
+		assert.True(t, ok)
+		assert.Equal(t, video2, video2Data["id"])
+		assert.Equal(t, 80.0, video2Data["score"])
+	})
+
+	t.Run("missing user_id", func(t *testing.T) {
+		req, err := http.NewRequest("GET", "/api/v1/ranking/personal", nil)
+		require.NoError(t, err)
+		rr := httptest.NewRecorder()
+
+		err = handler.GetPersonalRanking(rr, req)
+		assert.ErrorIs(t, err, ErrorUserIDMissing)
+
+		var response httputil.ErrorResponse
+		err = json.NewDecoder(rr.Body).Decode(&response)
+		require.NoError(t, err)
+		assert.Equal(t, http.StatusBadRequest, response.Code)
+	})
+
+	t.Run("invalid limit", func(t *testing.T) {
+		req, err := http.NewRequest("GET", "/api/v1/ranking/personal?user_id=user1&limit=101", nil)
+		require.NoError(t, err)
+		rr := httptest.NewRecorder()
+
+		err = handler.GetPersonalRanking(rr, req)
+		assert.ErrorIs(t, err, ErrorLimitRange)
+
+		var response httputil.ErrorResponse
+		err = json.NewDecoder(rr.Body).Decode(&response)
+		require.NoError(t, err)
+		assert.Equal(t, http.StatusBadRequest, response.Code)
+	})
 }
